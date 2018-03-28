@@ -1,0 +1,238 @@
+#!/bin/bash
+#=======================================================================================
+# readtide:     Read Kilo Moana Tidegauge data
+#=======================================================================================
+#
+#  Usage:       readtide  [OPTIONS]
+#
+#  Depends:     socat, date
+#
+#  Options:
+#
+#      -x, --xtrace     Enable debug output to console
+#      -h, --help       Print this header
+#
+#      -i, --interval   Set Tide Gauge polling interval (seconds)
+#                       Default: 1 second
+#
+#      -a, --address    Specify target ip address
+#                       Default: 192.168.1.98
+#
+#      -p, --tcpport    Specify tcp port
+#                       Default: 2101
+#
+#      -b, --basedir    Base directory where logfiles are saved
+#                       Should use absolute path
+#                       Default: $HOME
+#
+#      -l, --logprefix  Specify logfile prefix
+#                       Default: radargauge
+#
+#  Examples:
+#
+#    Run using default values
+#        readtide
+#
+#    Run on tcp port 5555, logging files to /home/gps/Project/Radar_Gauge/
+#        readtide -p 5555 -b /home/gps/Project/Radar_Gauge
+#
+#    Set interval to 10 seconds
+#        readtide -i 10
+#        readtide --interval 10
+#
+#TYoung=NOV2017=========================================================================
+
+set -o nounset
+set -o errexit
+set -o pipefail
+
+#=======================================================================================
+# Functions
+#=======================================================================================
+
+fn_main() {
+    ## Set up environment
+    fn_set_environment "$@"
+
+    ## Trap signals
+    trap fn_clean_up SIGINT SIGTERM SIGQUIT SIGHUP
+
+    ## Check Dependencies
+    fn_dependency_check
+
+    ## Start up the tidegauge poller
+    fn_poll_gauge &
+    POLLERPID=$!   ## Get PID for later killing
+    
+    ## Read the data
+    fn_read_data
+    }  	
+
+fn_set_environment() {
+    ## Name of the script
+    readonly SCRIPT="${0##*/}"
+
+    ## Parse user specified options
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            -x|--xtrace)    set -o xtrace   ; shift 1 ;;
+            -h|--help)      fn_print_hdr    ; exit  0 ;;
+            -i|--interval)  INTERVAL=$2     ; shift 2 ;;
+            -a|--address)   TIDEADDR=$2     ; shift 2 ;;
+            -p|--tcpport)   TIDEPORT=$2     ; shift 2 ;;
+            -b|--basedir)   BASEDIR=$2      ; shift 2 ;;
+            -l|--logprefix) LOGPREFIX=$2    ; shift 2 ;;
+            *) shift 1 ;;   ## ignores anything it doesn't know
+        esac
+    done
+
+    ## Use default values if not specified by user
+    [[ -z ${TIDEPORT:-}  ]] && TIDEPORT=2101
+    [[ -z ${TIDEADDR:-}  ]] && TIDEADDR=192.168.1.98
+    [[ -z ${POLLCHAR:-}  ]] && POLLCHAR='$'
+    [[ -z ${INTERVAL:-}  ]] && INTERVAL=1
+    [[ -z ${BASEDIR:-}   ]] && BASEDIR="${HOME}"
+    [[ -z ${LOGPREFIX:-} ]] && LOGPREFIX=tidegauge
+    [[ -z ${TG_PTY:-}    ]] && TG_PTY="${BASEDIR}/.${LOGPREFIX}_${RANDOM}.pty"
+    
+    ## Dependencies get put into an array for later checking
+    DEPENDS=(socat date)
+
+    ## Need to sanitize inputs
+    fn_sanitize_inputs || exit
+    }
+
+fn_clean_up() {
+    ## First unset the trap to avoid race condition
+    trap - SIGINT SIGHUP SIGTERM SIGQUIT
+
+    ## Kill the tide gauge polling loop
+    kill -15 "${POLLERPID:-BLANK}" >/dev/null 2>&1
+    exit
+    }
+
+fn_print_hdr() {
+    ## Universal header function, script reads itself up to the first
+    ## blank line, stripping out the first comment symbol on each line
+    ## and the shabang at the top.
+    ## Want to preserve whitespace so set IFS to ""
+    while IFS='' read -r LINE; do
+
+        ## Look at the lines
+        case ${LINE} in
+            \#!*) continue                    ;; ## Strip out shebang
+            "")   echo "" ; break             ;; ## Stop if blank line
+            *)    printf '%s\n' "${LINE/\#/}" ;; ## Print everything else
+        esac
+        	    
+    ## Pipe the whole thing into more for pagination
+    done < "$0" | more
+    }
+
+fn_sanitize_inputs() {
+    ## Tide Gauge ip should be pingable
+    ping -c 1 "${TIDEADDR}" >/dev/null 2>&1 || return 1
+
+    ## Tide Gauge port
+    [[ ${TIDEPORT//[0-9]/} = "" ]] || return 1 
+    [[ ${TIDEPORT} -le 65535 ]]    || return 1
+    [[ ${TIDEPORT} -gt 0 ]]        || return 1
+
+    ## Interval
+    printf -v INT_TEST '%d' "${INTERVAL}" || return 1
+
+    ## Base logging direcory
+    mkdir -p "${BASEDIR}" || return 1
+    }
+    
+fn_dependency_check() {
+    for d in ${DEPENDS[@]}; do
+        which $d >/dev/null 2>&1 || exit 1
+    done
+    }
+
+fn_poll_gauge() {
+    ## This timing loop gets forked off to a subshell so it doesn't
+    ## have to wait for any other parts of the script, giving better
+    ## time accuracy.
+    
+    while sleep "${INTERVAL}"s; do
+        ## See if pty exists, if not, launch new socat pipe
+        [[ -w ${TG_PTY} ]] || { \
+            socat -T10 tcp:"${TIDEADDR}":"${TIDEPORT}" pty,echo=0,link="${TG_PTY}" &
+
+            ## Delay until new socat pipe is writable
+            ## The X counter prevents infinite loop
+            local X=0
+            until [[ -w ${TG_PTY} ]]; do
+                sleep 0.1s
+                let X+=1
+                [[ $X -gt 100 ]] && return 1
+            done
+            }
+
+        ## Send polling character
+        echo "${POLLCHAR}" >> "${TG_PTY}"
+    done
+    }    
+
+fn_read_data() {
+    ## Reads tide gauge data and performs appropriate action
+
+    ## Make sure pty is readable
+    until [[ -r ${TG_PTY} ]]; do
+        sleep 0.1s
+    done
+    
+    ## Read the pty
+    ## Need to introduce a small delay to allow the radar gauge to respond
+    ## to each poll. 200ms seems a good amount of time.
+    while read -t "${INTERVAL}".2 -r LINE < "${TG_PTY}" || fn_timeout; do
+       	ARRAY=(${LINE//[^[:print:]]/})  ## Strip out non-printable chars
+
+       	## Valid lines start with =001#
+       	case "${ARRAY[0]}" in
+       	    =001#) fn_parse_data  ;;  ## Valid data, parse it
+       	    *) 	   continue       ;;  ## Drop anything else
+      	esac
+    done 
+    }
+
+fn_timeout() {
+    LINE='=001# -9.999'
+    }
+
+fn_parse_data() {
+    ## Valid data line has been received
+    ## First generate a timestamp
+    fn_gen_timestamp
+
+    ## Pull out desired fields
+    HEIGHT="${ARRAY[1]}"
+
+    ## Format data output
+    DATA="${YR} ${MON} ${DAY} ${HR} ${MIN} ${SEC} ${HEIGHT}"
+    LOGFILE="${BASEDIR}/${LOGPREFIX}_${YR}${MON}${DAY}${HR}.log"
+    
+    ## Write to logfile
+    echo "${DATA}" >> "${LOGFILE}"
+    }
+
+
+fn_gen_timestamp() {
+    ## generate timestamp and pull out fields
+    DATE=($(date +'%Y %m %d %H %M %S'))
+    YR="${DATE[0]}"
+    MON="${DATE[1]}"
+    DAY="${DATE[2]}"
+    HR="${DATE[3]}"
+    MIN="${DATE[4]}"
+    SEC="${DATE[5]}"
+    #POSIX="${DATE[6]}"
+    }
+
+########################################################################
+# Execute
+########################################################################
+
+fn_main "$@"

@@ -1,0 +1,548 @@
+#!/bin/bash
+#==================================================================================
+# winchlog:  Receives LCI90i MTNW3 data streams, logs to file,
+#            and transmits UDP for other logging, and display
+#
+# Usage:     winchlog
+#
+# Depends:   socat
+#
+#TYoung 2017/05=====================================================================
+
+#==================================================================================
+# Bash options
+#==================================================================================
+
+set -o nounset
+set -o errexit
+set -o pipefail
+LC_CTYPE=C
+
+#==================================================================================
+# Functions
+#==================================================================================
+
+fn_main() {
+    fn_set_environment "$@"
+    trap fn_clean_up INT TERM HUP QUIT
+    fn_read_data
+    }
+
+fn_clean_up() {
+    trap - INT TERM HUP QUIT
+    [[ -d ${PIPEDIR} ]] && rm -rf "${PIPEDIR}"
+    exit
+    }
+
+fn_set_environment() {
+    ## Name of the script
+    readonly SCRIPT="${0##*/}"
+
+    ## Parse user specified options
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            -x|--xtrace)    set -o xtrace   ; shift 1 ;;
+            -h|--help)      fn_print_hdr    ; exit  0 ;;
+            -d|--datadir)   DATADIR=$2      ; shift 2 ;;
+            *) shift 1 ;;   ## ignores anything it doesn't know
+        esac
+    done
+
+    ## Use default values if not specified by user
+    [[ ${DATADIR:-}    ]] || DATADIR=/data           ## Base dir for logging
+    [[ ${PIPEDIR:-}    ]] || PIPEDIR=$(mktemp -d /dev/shm/winchlog.XXXXXX) ## Where socat pipes live
+    [[ ${UDP_PORT:-}   ]] || UDP_PORT=6666                                 ## UDP port with winch feeds
+    [[ ${DISP_PORT:-}  ]] || DISP_PORT=5644                                ## UDP port for display
+    [[ ${IFACE:-}      ]] || IFACE=eth0                                    ## Ethernet interface
+    [[ ${CRUISEFILE:-} ]] || CRUISEFILE=${DATADIR}/cruiseid
+
+    ## will be removed after new display software is installed
+    readonly WINCH_DISP_PORT=5640                          ## UDP port for dynacon display
+
+    
+    ## Dependencies get put into an array for later checking
+    DEPENDS=(socat date)
+
+    ## Need to sanitize inputs
+    fn_sanitize_inputs || exit
+    }
+
+fn_print_hdr() {
+    ## Universal header function, script reads itself up to the first
+    ## blank line, stripping out the first comment symbol on each line
+    ## and the shabang at the top.
+    ## Want to preserve whitespace so set IFS to ""
+    while IFS='' read -r LINE; do
+
+        ## Look at the lines
+        case ${LINE} in
+            \#!*) continue                    ;; ## Strip out shebang
+            "")   echo "" ; break             ;; ## Stop if blank line
+            *)    printf '%s\n' "${LINE/\#/}" ;; ## Print everything else
+        esac
+        	    
+    ## Pipe the whole thing into more for pagination
+    done < "$0" | more
+    }
+
+fn_sanitize_inputs() {
+    ## Make sure DATADIR is writeable
+    mkdir -p "${DATADIR}" || fn_clean_up
+    touch "${DATADIR}"    || fn_clean_up
+
+    ## Make sure UDP_PORT is valid
+    [[ ${UDP_PORT} -lt 65535 ]] || fn_clean_up
+    [[ ${UDP_PORT} -gt 0     ]] || fn_clean_up
+    }
+    
+fn_read_data() { ## Parses STDOUT from socat
+    local LINE ARRAY CRUISEID LOGDATA
+
+    ## Default startup values
+    ## These are modified via bashdaq sentences
+    CRUISEID=default    ## Default cruiseid, gets updated
+    LOGDATA=1           ## Logs data by default
+    WINCH_TO_DISP=DYNACON  ## Default winch to send to display
+    [[ -r ${CRUISEFILE} ]] && CRUISEID=$(head -1 ${CRUISEFILE})
+
+    ## Read incoming data
+    while read -r LINE; do
+        LINE="${LINE//[^[:print:]]/}"      ## Strip out non-printable chars
+        IFS=' ,*' ARRAY=(${LINE})          ## Set delimiters, divide LINE into ARRAY
+
+        ## What kind of sentence is it?
+        case "${ARRAY[0]:-}" in
+            01RD)      fn_parse_lci90i_string &   ;; ## LCI90I sentence, fork to subshell
+            RD)        fn_parse_lci90_string  &   ;; ## LCI90 sentence, fork to subshell
+            \$BDCID)   fn_bd_cruiseid             ;; ## CruiseID string
+            *)         fn_log_badline ;;             ## Anything Else
+        esac
+        unset LINE ARRAY
+    done
+    }  < <(socat -u udp-recv:"${UDP_PORT}",reuseaddr STDOUT)
+
+fn_log_badline() {
+    DATE=$(date +'%c')
+    echo "${DATE} BAD LINE: ${LINE}" >> /dev/udp/kmhead1/5555
+    }
+
+fn_log_badcksum() {
+    DATE=$(date +'%c')
+    echo "${DATE} BAD CHECKSUM: ${LINE}" >> /dev/udp/kmhead1/5555
+    }
+    
+fn_parse_lci90i_string() {
+    ## Expects an mtnw3 string with a single winch
+    ## Winch name dictates logging directory and logfile name.
+
+    ## Checksum verification is slow, generate timestamp first.
+    fn_generate_timestamp
+
+    ## Validate checksum
+    fn_verify_lci_checksum "${LINE}" || return 1
+
+    ## Pull data from array fields
+    NAME="${ARRAY[2]}"
+    TENS="${ARRAY[3]%.*}"
+    SPEED="${ARRAY[4]%.*}"
+    PAYOUT="${ARRAY[5]%.*}"
+
+    ## Send data where it needs to go
+    [[ ${WINCH_TO_DISP} = DYNACON ]] && fn_output_to_display
+    #fn_output_to_mainlogger
+    fn_output_to_logfile
+    fn_output_to_laptop
+    }
+
+fn_parse_lci90_string() {
+    ## Winch name dictates logging directory and logfile name.
+
+    ## Should have 4 fields
+    [[ ${#ARRAY[@]} = 4 ]] || return 1
+
+    ## Generate timestamp.
+    fn_generate_timestamp
+
+    ## Pull data from array fields
+    NAME=PORTABLE
+    TENS="${ARRAY[1]%.*}"
+    SPEED="${ARRAY[2]%.*}"
+    PAYOUT="${ARRAY[3]}"
+
+    ## Send data where it needs to go
+    [[ ${WINCH_TO_DISP} = PORTABLE ]] && fn_output_to_display
+    #fn_output_to_mainlogger
+    fn_output_to_logfile
+    }
+
+fn_generate_timestamp() { ## Creates a timestamp for the data
+    IFS=, DATE=($(date +'%Y,%j,%m,%d,%H,%M,%S,%3N'))
+    ## Assign fields to variables
+    YR="${DATE[0]}"
+    DAY="${DATE[1]}"
+    HR="${DATE[4]}"
+    MIN="${DATE[5]}"
+    SEC="${DATE[6]}"
+    MSEC="${DATE[7]}"
+    ## Format the Timestamp
+    TIMESTAMP="${YR} ${DAY} ${HR} ${MIN} ${SEC} ${MSEC}"
+    }
+
+fn_verify_xor_checksum() { ## NMEA 0183 style checksum verification
+    ## Function expects input sentence as arg
+    ## Function will return a 1 if checksum is invalid
+
+    local NEXTVAL LEN NMEA_CHECKSUM GEN_CHECKSUM
+
+    ## Process the input string
+    STRING="${1}"
+    NMEA_CHECKSUM="${STRING#*\*}"                          ## Chksum is after the *
+    [[ ${NMEA_CHECKSUM} =~ [0-9A-F][0-9A-F] ]] || return 1 ## must be hexidecimal
+
+    ## Loop through STRING, convert each char to ascii val and xor.
+    ## Checksumming should start at second character (x=1) to skip $
+    XOR=0
+    for (( x=1; x<"${#STRING}"; x++ )); do       ## C style for loop
+        [[ ${STRING:$x:1} = '*' ]] && break      ## Stop at * (just in case)
+        printf -v NEXTVAL '%d' "'${STRING:$x:1}" ## convert character to ascii
+        (( XOR^="${NEXTVAL}" ))                  ## xor values
+    done
+
+    ## Checksum loop has exited
+    printf -v GEN_CHECKSUM '%02X' "${XOR}"       ## Convert final value to hexidecimal
+    [[ ${NMEA_CHECKSUM} = ${GEN_CHECKSUM} ]] || return 1 ## Compare to existing checksum
+    }
+
+fn_generate_xor_checksum() {  ## Converts a string to NMEA 0183 style sentence.
+    ## Expects arg without any $ or *
+    ## Stores result in STRING
+    local NEXTVAL NMEA_CHECKSUM GEN_CHECKSUM
+    STRING="${1}"
+
+    ## Loop through STRING, summing ascii values
+    XOR=0
+    for (( x=0; x<"${#STRING}"; x++ )); do       ## C style for loop
+        printf -v NEXTVAL '%d' "'${STRING:$x:1}" ## convert character to ascii
+        (( XOR^="${NEXTVAL}" ))                  ## xor values
+    done
+
+    ## Convert final value into hex
+    ## Add $, *, and the checksum in the proper place
+    printf -v STRING '$%s*%02X' "${STRING}" "${XOR}"
+    }
+
+fn_verify_lci_checksum() { ## LCI90I style checksum verification.
+    ## Will return a 1 if checksum is invalid
+    local STRING NEXTVAL LEN LCI_CHECKSUM GEN_CHECKSUM
+
+    STRING="${1}"
+    LCI_CHECKSUM="${STRING##*,}"     ## Expand STRING starting at last , to get checksum
+    GEN_CHECKSUM=0                   ## Start the calculated checksum at 0
+
+    ## Specify the number of characters in the string to iterate through.
+    ## We want to stop before we get to the checksum from the lci.
+    LEN="$(( ${#STRING} - ${#LCI_CHECKSUM} ))"
+
+    ## Loop through STRING, summing ascii values.
+    for (( x=0; x<"${LEN}"; x++ )); do           ## C style for loop
+        printf -v NEXTVAL '%d' "'${STRING:$x:1}" ## convert character to ascii
+        (( GEN_CHECKSUM+="${NEXTVAL}" ))         ## add values
+    done
+
+    ## Checksum must be limited to the last 4 digits
+    [[ ${#GEN_CHECKSUM} -gt 4 ]] && GEN_CHECKSUM="${GEN_CHECKSUM: -4}"
+
+    ## Compare checksums.  If test returns false, the whole function
+    ## will return false and the line gets dumped.
+    [[ ${GEN_CHECKSUM} -eq ${LCI_CHECKSUM} ]] || return 1
+    }
+
+fn_output_to_laptop() {
+    local PIPE DATA
+    PIPE=/dev/shm/udp_laptop_6666
+    [[ -w ${PIPE} ]] || {
+        socat -u pty,echo=0,link=${PIPE} udp-datagram:192.168.2.20:4444 &
+        X=0
+        until [[ -w ${PIPE} ]]; do
+            let X+=1
+            [[ ${X} -le 1000 ]] || return 1
+        done
+        }
+    echo ${LINE// /,} >> ${PIPE}
+    }
+
+fn_output_to_display() {  ## Prints data to display
+    local DATA PIPE
+
+    ## Do we want to send this line of winch data to the display?
+    [[ ${NAME} = ${WINCH_TO_DISP} ]] || return 0
+
+    PIPE="${PIPEDIR}"/disp_"${WINCH_DISP_PORT}"
+    BRCAST_PORT="${WINCH_DISP_PORT}"
+
+    ## Format the data output
+    DATA="dynacon ${TENS} ${SPEED} ${PAYOUT}"
+
+    ## Make sure pipe exists
+    [[ -w ${PIPE} ]] || {  ## Pipe doesn't exist, create a new one
+        BRCAST_IP="192.168.1.255"
+        socat -u pty,echo=0,link="${PIPE}" udp-datagram:"${BRCAST_IP}":"${DISP_PORT}",broadcast &
+
+        ## Wait for pipe to be writeable
+        X=0
+        until [[ -w ${PIPE} ]]; do
+            let X+=1
+            [[ ${X} -le 1000 ]] || return 1
+        done
+        }
+
+    ## Print data into pipe
+    printf '%s\n' "${DATA}" >> "${PIPE}"
+    }
+
+
+fn_output_to_logger() {  ## Prints data to main logger
+    local DATA PIPE BRCAST_PORT
+
+    case "${NAME}" in
+        DYNACON)
+            PIPE="${PIPEDIR}"/brcast_"${WINCH680_PORT}"
+            BRCAST_PORT="${WINCH680_PORT}"
+            ;;
+
+        CALEY)
+            PIPE="${PIPEDIR}"/brcast_"${WINCH322_PORT}"
+            BRCAST_PORT="${WINCH322_PORT}"
+            ;;
+
+        *) break ;;
+    esac
+
+    ## Format the data output
+    printf -v DATA 'RD,%s,%08.0f,%08.1f,%08.1f\r\n' \
+                   "${ARRAY[1]}" "${ARRAY[3]}" "${ARRAY[4]}" "${ARRAY[5]}" || fn_error
+
+    ## Make sure pipe exists
+    [[ -w ${PIPE} ]] || {  ## Pipe doesn't exist, create a new one
+        IP_ADDR=$(ip addr show "${IFACE}" | grep -Po 'inet \K[\d.]+')
+        BRCAST_IP="${IP_ADDR%.*}.255"
+        socat -T2 -u pty,echo=0,link="${PIPE}" udp-datagram:"${BRCAST_IP}":"${BRCAST_PORT}",broadcast &
+
+        ## Wait for pipe to be writeable
+        X=0
+        until [[ -w ${PIPE} ]]; do
+            let X+=1
+            [[ ${X} -le 1000 ]] || return 1
+        done
+        }
+
+    ## Print data into pipe
+    printf '%s' "${DATA}" >> "${PIPE}" || true
+    }
+
+
+fn_output_to_logfile() {  ## Prints data to logfile
+    ## Is logging wanted?
+    [[ ${LOGDATA} = 1 ]] || return 1
+
+    ## Is it 1970?
+    [[ ${YR} -ge 2017 ]] || return 1
+
+    local DATA PIPE
+    PIPE="${PIPEDIR}"/"${CRUISEID}"_"${NAME}"_"${DAY}"_logfile
+
+    ## Format the data output
+    printf -v DATA '%s %s %08.0f %08.1f %08.0f' \
+                   "${TIMESTAMP}" "${NAME,,}" "${SPEED}" "${PAYOUT}" "${TENS}" || return 1
+
+    ## Specify the logfile and create necessary directories
+    LOGDIR="${DATADIR}"/"${CRUISEID}"/"${NAME,,}"
+    LOGFILE="${LOGDIR}"/"${NAME,,}"_"${DAY}"_raw
+    [[ -d ${LOGDIR} ]] || mkdir -p "${LOGDIR}"
+
+    ## Make sure pipe exists
+    [[ -w ${PIPE} ]] || {  ## Pipe doesn't exist, create a new one
+        socat -T60 -u pty,echo=0,link="${PIPE}" GOPEN:"${LOGFILE}" &
+
+        ## Wait for pipe to be writeable
+        ## the X counter avoids a possible race condition
+        X=0
+        until [[ -w ${PIPE} ]]; do
+            let X+=1
+            [[ ${X} -le 1000 ]] || return 1
+        done
+        }
+
+    ## If socat symlinked LOGFILE goes missing, delete the pty so the
+    ## socat pipe gets remade on the next go around.  Orphaned socat
+    ## process now has no input and will self terminate after timeout.
+    [[ -w ${LOGFILE} ]] || {  ## Logfile missing/not writeable
+        rm "${PIPE}"
+        return 1
+        }
+
+    ## Print data into pipe
+    printf '%s\n' "${DATA}" >> "${PIPE}"
+    }
+
+fn_error() {
+    echo ${LINE} >> /data/winchlog.log
+    }
+# ==============================================================================================
+# Bashdaq command and control functions
+# ==============================================================================================
+
+fn_bd_status() { ## Status Request, ACK with HOSTNAME IPADDR CRUISEID DISKUSAGE and Logging status
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Get disk usage
+    DISK_USAGE=$(df --output=pcent "${DATADIR}" | tail -1)
+    IP_ADDR=$(ip addr show "${IFACE}" | grep -Po 'inet \K[\d.]+')
+
+    ## Translate LOGDATA state into LOGGING or NOTLOGGING
+    LOGSTATUS=NOTLOGGING  ## Default state
+    [[ ${LOGDATA} = 1 ]] && LOGSTATUS="LOGGING"
+
+    ## Format Data String
+    STRING="BDACK,${HOSTNAME},${IP_ADDR},${CRUISEID},${DISK_USAGE// /},${LOGSTATUS}"
+
+    ## Checksum generation
+    fn_generate_xor_checksum "${STRING}"
+
+    ## Broadcast the string
+    IP_ADDR=$(ip addr show "${IFACE}" | grep -Po 'inet \K[\d.]+')
+    BRCAST_IP="${IP_ADDR%.*}.255"
+    printf '%s\n' "${STRING}" \
+           | socat -u STDIN udp-datagram:"${BRCAST_IP}":"${UDP_PORT}",broadcast
+    }
+
+fn_bd_reboot() { ## Reboot request
+    ## QC
+    [[ ${#ARRAY[@]} -eq 3 ]]   || return 1
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Who should reboot?
+    case "${ARRAY[1]}" in
+        "${HOSTNAME,,}"|ALL) ## This machine should reboot
+            LOGDATA=0
+            reboot
+            exit
+            ;;
+
+        *) return 1 ;;     ## Reboot was for someone else
+    esac
+    }
+
+fn_bd_shutdown() { ## Shutdown request
+    ## QC
+    [[ ${#ARRAY[@]} -eq 3 ]]   || return 1
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Who should shutdown?
+    case "${ARRAY[1]}" in
+        "${HOSTNAME,,}"|ALL) ## This machine should shutdown
+            LOGDATA=0
+            shutdown -hP now
+            exit
+            ;;
+
+        *) true ;;         ## Shutdown was for someone else
+    esac
+    }
+
+fn_bd_cruiseid() { ## CruiseID update
+    fn_verify_xor_checksum "${LINE}" || return 1
+    CRUISEID="${ARRAY[1]}"
+    echo ${CRUISEID} > ${CRUISEFILE}
+    }
+
+fn_bd_logging() { ## Start/Stop logging
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Who should start/stop logging?
+    case "${ARRAY[1]}" in
+        "${HOSTNAME}"|ALL)  ## This machine should start/stop
+            LOGDATA="${ARRAY[2]}"
+            ;;
+
+        *) true ;;              ## Someone else
+    esac
+    }
+
+fn_bd_winchdisp() { ## Sets winch data to send to the display
+    ## WINCH_TO_DISP gets compared to the NAME field on incoming winch data sentences
+    ## in fn_output_to_display.  Only matching lines get transmitted.
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Set which NAME gets sent to display
+    export WINCH_TO_DISP="${ARRAY[1]}"
+    }
+
+#=====================================================================================================
+# Execute - The only thing that runs globally should be the above global constants, and main function
+#=====================================================================================================
+
+fn_main "$@"
+
+#=====================================================================================================
+# Notes
+#=====================================================================================================
+
+# This script listens on a UDP port which has many different types of
+# sentences coming in. It will pick out winch data and Bashdaq commands
+# and proceed accordingly. A line of raw winch data generally looks like:
+# <SOH><RS>01RD,2017-05-18T20:36:30.453,DYNACON,-0009081,000000.0,-00032.6,3408<\r><\n>
+#
+# Each line starts with non-printable ascii characters 001 and
+# 036 (Start Of Header and Record Separator) and ends with carriage return
+# and line feed. These get stripped. After verification, parsing, and timestamping
+# the end result being logged to disk will look like:
+#
+# YR   DAY HR MIN SEC MS NAME    SPEED    PAYOUT  TENSION
+# 2017 139 02 28 31 560 dynacon 00000000 -00032.6 -0009081
+#
+# The last field of a winch raw data line (the '3408' above) is a checksum
+# created by summing up the ascii values of all the printable
+# characters starting from the beginning of the line (01RD), to the
+# last comma before the checksum. This number is limited to 4 digits
+# and if the sum is larger then only the last 4 digits are used.
+#
+# Bashdaq commands are nmea 0183 style sentences which travel on the
+# same UDP port as the data does and can be used to give certain
+# instructions to the logging routine.  Logging can be started/stopped.
+# The Cruise ID can be changed. The loggers can be rebooted or shut down.
+# Loggers can also be instructed to announce their presence, giving their
+# hostname, ip address, current cruise id, disk usage, and logging status.
+# This is useful to see what loggers are running, and what they are doing.
+#
+# read_loop timing, and efficiency:
+# Subshells in linux are cheap. When a winch string comes in it has to undergo
+# checksumming which is relatively slow compared to other languages and may
+# take on the order of several ms depending on the length of the string.
+# With previous versions, if a new winch sentence came down the pipe before the
+# loop had finished with the previous one, the new sentence would have to sit in
+# the socat buffer.  This was ok when listening to only one winch controller because
+# it was pretty much guaranteed that the loop would finish with one sentence before
+# the next was received 50ms later. Previous versions were designed for one winch feed.
+# With multiple fast winch feeds, in order to get the most accurate timestamping
+# we need to get back into the read state as quickly as possible for the next line.
+# The fastest way to do this is to fork and hand off each winch sentence to a
+# (short lived) subshell. The subshell will process that line of data
+# and then simply exit. Note that socat pipes are used for holding the log files open
+# and do not die with the child process. Each child process simply sends its line of
+# data to the pty end of the socat pipe. This saves repeated opening of the log file.
+# On slower data feeds, a simple append operation >> would suffice but fast feeds like
+# winch data require the log file to be held open. These socat pipes are given a 60 second
+# timeout.  If nothing gets written to their input for 60 seconds, the socat process will
+# exit.  This means if an lci90i is turned off, 60 seconds later the logfile pipe for that
+# winch will vanish.  This helps close logfiles, and keeps the number of socat pipes down.
+#
+# The subshell handoff also gives us multithreading for free and a balanced load across all cores
+# since each subshell gets automatically handed to the least busy core.
+# This works well with low power, quad-core, ARM computers like rpi or odroid, but is counterproductive
+# on single core machines.
+#
+# BashDAQ sentences may be data from other remotes or commands which influence
+# variables such as cruise id or logging state which need to be inherited.
+# Command sentences may be used to change variables in the running logging routine so
+# they don't get forked off for inheritance and scope reasons.

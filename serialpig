@@ -1,0 +1,235 @@
+#!/bin/bash
+#================================================================================
+# serialpig - stty wrapper script that takes non-cryptic user options and
+#             reliably handles physical device insertion and removal.  Useful for
+#             bash scripts that involve reading ascii serial devices.
+#================================================================================
+#
+#  Usage:      serialpig  [options]
+#
+#              Without any options, defaults to /dev/ttyUSB0 9600 8N1
+#
+#  Depends:    stty
+#
+#  Options:
+#
+#      -x --xtrace      Enable debug output to console
+#
+#      -b --baudrate    Specify serial port baud rate.
+#                       Default: 9600
+#                       Ex: -b 19200
+#
+#      -d --device      Specify serial device
+#                       Default: /dev/ttyUSB0
+#                       Ex: -d /dev/ttyS0
+#
+#      -i --identifier  Identifier to help follow logfile events
+#                       Default: RANDOM
+#                       Ex: -i Grav
+#
+#      -l --logfile     Logfile for status messages. If no logfile
+#                       is desired, point to /dev/null
+#                       Default: $HOME/serialpig.log
+#                       Ex: -l /dev/shm/serial.log
+#
+#      -p --parameters  Desired serial port start/stop bits, parity, etc
+#                       Default: 8N1
+#                       Ex: -p 7E1
+#
+#  Examples:
+#
+#      Open device /dev/ttyS0 at 9600 baud, 7N1
+#          serialpig -d /dev/ttyS0 -p 7N1
+#
+#      Open device /dev/ttyUSB1 at 4800 baud 8N1
+#          serialpig -d /dev/ttyUSB1 -b 4800
+#
+#      Open device /dev/ttyACM0 at 19200 baud 8N1, identify as GRAV
+#          serialpig -d /dev/ttyACM0 -b 19200 -i GRAV
+#
+#  Behavior:  If specified serial device is not already detected, will wait
+#             for it to be inserted.  Once device is detected, it sets baud
+#             rate and parameters via stty, and binds fd 4 to the serial
+#             port output.  It then reads data from the input fd.
+#             Presence of the device node is regularly checked. If device node
+#             dissappears (device removed), it closes the file descriptors and
+#             waits for the device to reappear.
+#             All actions are saved to LOGFILE
+#
+# TYoung JAN2017 ================================================================
+
+#================================================================================
+# Functions
+#================================================================================
+
+fn_main() {
+    ## Set up environment
+    fn_set_environment "$@"
+
+    ## Check Dependencies
+    fn_dependency_check
+
+    ## Trap signals
+    trap fn_cleanup HUP INT TERM QUIT
+
+    ## Endless loop
+    while true; do
+        ## See if device node is present
+        fn_log_msg "Waiting for ${DEVICE}"
+        fn_check_device || return 1
+
+        ## Sanitize params
+        fn_sanitize_params   || return 1
+        
+        ## Device found, configure
+        fn_log_msg "Found device ${DEVICE}"
+        fn_config_serial || fn_config_fail
+
+        ## Device configured, read incoming data
+        fn_read_data || return 1
+    done
+    }
+
+fn_set_environment() {
+    ## Name of the script
+    readonly SCRIPT="${0##*/}"
+
+    ## Dependencies
+    DEPENDS=(stty)
+
+    ## Parse user options
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            -h|--help)       fn_print_hdr  ; exit 0  ;; ## Print header
+            -x|--xtrace)     set -o xtrace ; shift 1 ;; ## Enable debugger
+            -d|--device)     DEVICE="$2"   ; shift 2 ;; ## Specify device node
+            -b|--baudrate)   BAUD="$2"     ; shift 2 ;; ## Specify baud rate
+            -i|--identifier) IDENT="$2"    ; shift 2 ;; ## Logfile Identifier
+            -l|--logfile)    LOGFILE="$2"  ; shift 2 ;; ## Specify logfile
+            -p|--parameters) PARAMS="$2"   ; shift 2 ;; ## 8N1, 7E1, etc
+            *) shift 1 ;; ## ignores anything not conforming to the above
+        esac
+    done
+
+    ## Set defaults or prompt for user input
+    [[ -v DEVICE  ]] || DEVICE=/dev/ttyUSB0
+    [[ -v BAUD    ]] || BAUD=9600
+    [[ -v PARAMS  ]] || PARAMS=8N1
+    [[ -v IDENT   ]] || IDENT="${RANDOM}"
+    [[ -v LOGFILE ]] || LOGFILE="/dev/shm/${SCRIPT}.log"
+
+    }
+
+fn_print_hdr() {
+	## Universal header function, script reads itself up to the first
+	## blank line, stripping out the first comment symbol on each line
+    ## and the shebang at the top.
+    echo 
+	## Want to preserve whitespace so set IFS to ""
+	while IFS='' read -r LINE; do
+
+	    ## Skip the shabang.  Use wildcard instead of /usr/bin or the like
+	    ## to accomodate everybody. /bin/bash, /usr/bin/env bash... etc
+        case ${LINE} in
+            \#!*) continue                    ;; ## Strip out shebang
+            "")   echo "" ; break             ;; ## Stop if blank line
+            *)    printf '%s\n' "${LINE/\#/}" ;; ## Print everything else
+        esac
+        	    
+	## Pipe the whole thing into more for pagination
+	done < "$0" | more
+    }
+
+fn_dependency_check() {
+    for d in ${DEPENDS}; do
+        which $d >/dev/null || exit
+    done
+    }
+
+fn_check_device() {
+    ## A loop that doesn't end until device node is readable
+	until [[ -r ${DEVICE} && -c ${DEVICE} ]]; do
+        sleep 1s
+    done
+    }
+
+fn_sanitize_params() {
+    ## Sanitize Serial parameters
+    ## Stty options:
+    ## clocal - disable modem hardware control signals ( - enable)
+    ## [-]crtscts - enable RTS/CTS handshaking (- enable)
+    ## csN - set character size to N bits [5..8]
+    ## [-]cstopb - use 2 stop bits, (1 with -)
+    ## [-]parenb - generate parity bit in output, expect in input ( - don't)
+    ## [-]parodd - set parity odd (- for even)
+    case ${PARAMS^^} in
+        8N1) STTY_ARGS="cs8 crtscts clocal -parenb -cstopb" ;;
+        7N1) STTY_ARGS="cs7 crtscts clocal -parenb -cstopb" ;;
+        7N2) STTY_ARGS="cs7 crtscts clocal -parenb  cstopb" ;;
+        7E1) STTY_ARGS="cs7 crtscts clocal -parenb -parodd -cstopb" ;;
+        7E2) STTY_ARGS="cs7 crtscts clocal -parenb -parodd  cstopb" ;;
+        7O1) STTY_ARGS="cs7 crtscts clocal -parenb  parodd -cstopb" ;;
+        7O2) STTY_ARGS="cs7 crtscts clocal -parenb  parodd  cstopb" ;;
+
+        ## Otherwise set to 8N1
+        *)   PARAMS=8N1
+             STTY_ARGS="cs8 crtscts clocal -parenb -cstopb" ;;
+    esac
+    }
+
+fn_config_serial() {
+    ## Use stty utility to set serial parameters for desired port
+    ## Baud rate, stop bits, parity, flow control, etc
+    ## Last, assign file descriptors to the device for reading/writing
+    stty -F ${DEVICE} ${BAUD} ${STTY_ARGS} ${MODE} || return 1
+    fn_log_msg "Setting ${DEVICE} to ${BAUD},${PARAMS^^}"
+    exec 4<"${DEVICE}"
+    }
+
+fn_config_fail() {
+    fn_log_msg "Failed to configure serial port ${DEVICE}"
+    exit
+    }
+
+fn_read_data() {
+    ## Reads the incoming data and echos to STDOUT
+    ## When loop ends, returns control back to the
+    ## endless main loop, which may restart the read
+    ## loop when device node becomes available again.
+    while [[ -r "${DEVICE}" ]]; do
+        read -r -u 4 LINE
+
+        ## Don't transmit blank lines
+        [[ ${LINE:-} = "" ]] && continue
+
+        ## Parsing functions would go here
+
+        ## Print LINE to STDOUT
+        printf '%s\n' "${LINE}"
+
+    done
+
+    ## Read loop has ended so DEVICE must have disappeared
+    ## If you don't close the file descriptors, next time device is
+    ## reinserted it will come up with a different node and not be
+    ## detected.  Close FDs
+    fn_log_msg "${DEVICE} Disconnected"
+    [[ -t 4 ]] && exec 4<&-
+    }
+
+fn_cleanup() {
+    trap - TERM HUP QUIT INT
+    [[ -t 4 ]] && exec 4<&-
+    fn_log_msg "Serialpig ${DEVICE} Exiting"
+    exit
+    }
+
+fn_log_msg() {
+    echo "${SCRIPT} $(date +'%F %T %Z') ${IDENT}: $@" >> "${LOGFILE}"
+    }
+
+#================================================================================
+# Execute - The only thing here should be the main function
+#================================================================================
+
+fn_main $@

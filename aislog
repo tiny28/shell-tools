@@ -1,0 +1,274 @@
+#!/bin/bash
+#==================================================================================
+# aislog:    Logs AIS udp stream to file in siscon format
+#
+# Usage:     aislog
+#
+# Options:  -h, --help     Prints this header
+#
+#           -x, --xtrace   Enables debug output to console
+#
+#           -c, --cruiseid Specify CRUISEID data gets logged to
+#                           Default: default
+#
+#           -d, --datadir   Specify base data dir where logged data is saved
+#                           Default: /data
+#
+#           -p, --udpport   Specify UDP port to listen for AIS Data
+#                           Default: 8764
+#
+#           -i, --ident     Identifier in logfile (not data logfile)
+#                           Default: RANDOM
+#
+#           -l, --logfile   Where program messages are saved (not data logfile)
+#                           Default: HOME/bashdaq.log
+#
+# Depends:   socat
+#
+#TYoung 2017/11====================================================================
+
+#==================================================================================
+# Options
+#==================================================================================
+
+set -o nounset  ## exit on trying to call an unset variable
+set -o errexit  ## exit on exit status other than 0
+set -o pipefail ## exit status of entire pipeline is 1 if any command fails
+
+#==================================================================================
+# Functions
+#==================================================================================
+
+fn_main() {  ## Main routine.  Gets run at the bottom
+    ## Set up program environment
+    fn_set_environment "$@"
+
+    ## Trap Signals
+    trap fn_clean_up SIGINT SIGTERM SIGHUP SIGQUIT
+
+    ## Get Data
+    fn_read_ais
+    }
+
+fn_set_environment() {
+    ## Name of the script
+    readonly SCRIPT="${0##*/}"
+
+    LC_CTYPE=C
+
+    DATADIR=/data                                 ## Base dir for logging
+    PIPEDIR=$(mktemp -d /dev/shm/aislog.XXXXXX)   ## Where socat pipes live
+    UDP_PORT=8764                                 ## UDP port with ais feeds
+    CRUISEFILE=${DATADIR}/.cruiseid
+    CRUISEID=default
+    [[ -r ${CRUISEFILE} ]] && CRUISEID=$(head -1 ${CRUISEFILE})
+    IDENT="${RANDOM}"
+    LOG="${HOME}/bashdaq.log"
+
+    ## Dependencies
+    DEPENDS=(socat date)
+
+    ## Parse user options
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            -h|--help)       fn_print_hdr  ; exit  0 ;; ## Print header
+            -x|--xtrace)     set -o xtrace ; shift 1 ;; ## Enable debugger
+            -c|--cruiseid)   CRUISEID="$2" ; shift 2 ;; ## Set CRUISE ID
+            -d|--datadir)    DATADIR="$2"  ; shift 2 ;; ## Set data dir
+            -p|--udpport)    UDP_PORT="$2" ; shift 2 ;; ## Specify UDP Port
+            -i|--identifier) IDENT="$2"    ; shift 2 ;; ## Logfile Identifier
+            -l|--logfile)    LOG="$2"      ; shift 2 ;; ## Specify logfile
+            *) shift 1 ;; ## ignores anything not conforming to the above
+        esac
+    done
+
+    ## This is where you would prompt user for unset variables
+    ## [[ -z ${IDENT:-}  ]] && fn_prompt_val
+
+    ## Make sure Log is writable
+    touch "${LOG}" || exit
+    }
+
+fn_print_hdr() {
+	## Universal header function, script reads itself up to the first
+	## blank line, stripping out the first comment symbol on each line
+    ## and the shebang at the top.
+	clear
+	## Want to preserve whitespace so set IFS to ""
+	while IFS='' read -r LINE; do
+
+	    ## Skip the shebang.  Use wildcard instead of /usr/bin or the like
+	    ## to accomodate everybody. /bin/bash, /usr/bin/env bash... etc
+        case ${LINE} in
+            \#!*) continue                    ;; ## Strip out shebang
+            "")   echo "" ; break             ;; ## Stop if blank line
+            *)    printf '%s\n' "${LINE/\#/}" ;; ## Print everything else
+        esac
+        	    
+	## Pipe the whole thing into more for pagination
+	done < "$0" | more
+    }
+
+fn_clean_up() {
+    fn_log_stop
+    trap - SIGINT SIGTERM SIGHUP SIGQUIT
+    [[ -d ${PIPEDIR} ]] && rm -rf "${PIPEDIR}"
+    exit
+    }
+
+fn_read_ais() { ## Parses STDOUT from socat
+    local LINE ARRAY LOGDATA
+
+    ## update logfile
+    fn_log_start
+    
+    ## main looping part
+    while read -r LINE; do
+        LINE="${LINE//[^[:print:]]/}"      ## Strip out non-printable chars
+        IFS=' ,*' ARRAY=(${LINE})          ## Set delimiters, divide LINE into ARRAY
+
+        ## What kind of sentence is it?
+        case "${ARRAY[0]:-ERROR}" in
+            !AIVDO)  fn_parse_ais_string || fn_log_badsum ;;
+            !AIVDM)  fn_parse_ais_string || fn_log_badsum ;; 
+            \$AIALR) fn_parse_ais_string || fn_log_badsum ;;
+            \$PSTT)  fn_parse_ais_string || fn_log_badsum ;;
+            \$BDCID) fn_bd_cruiseid      || fn_log_badsum ;; ## Bashdaq cruiseid update
+            *)       fn_log_badline                       ;; ## Anything Else
+        esac
+        unset LINE ARRAY
+    done
+    }  < <(socat -u udp-recv:"${UDP_PORT}",reuseaddr STDOUT)
+
+
+fn_parse_ais_string() {
+    ## Checksum verification is slow, generate timestamp first.
+    fn_generate_timestamp
+
+    STAMP=AIS
+    
+    ## Validate checksum
+    fn_verify_xor_checksum "${LINE}" || return 1
+
+    ## Send data where it needs to go
+    fn_output_to_logfile
+    }
+
+fn_log_start() {
+    echo "${SCRIPT} $(date +'%F %T %Z') ${IDENT}: Started Logging" >> "${LOG}"
+    }
+
+fn_log_stop() {
+    echo "${SCRIPT} $(date +'%F %T %Z') ${IDENT}: Stopped Logging" >> "${LOG}"
+    }
+    
+fn_log_badline() {
+    echo "${SCRIPT} $(date +'%F %T %Z') ${IDENT}: Rejected Line: ${LINE}" >> "${LOG}"
+    }
+
+fn_log_badsum() {
+    echo "${SCRIPT} $(date +'%F %T %Z') ${IDENT}: Bad Checksum: ${LINE}" >> "${LOG}"
+    }
+    
+fn_generate_timestamp() { ## Creates a timestamp for the data
+    IFS=, DATE=($(date +'%Y,%j,%m,%d,%H,%M,%S,%3N'))
+    ## Assign fields to variables
+    YR="${DATE[0]}"
+    DAY="${DATE[1]}"
+    HR="${DATE[4]}"
+    MIN="${DATE[5]}"
+    SEC="${DATE[6]}"
+    MSEC="${DATE[7]}"
+    ## Format the Timestamp
+    TIMESTAMP="${YR} ${DAY} ${HR} ${MIN} ${SEC} ${MSEC}"
+    }
+
+fn_verify_xor_checksum() { ## NMEA 0183 style checksum verification
+    ## Function expects input sentence as arg
+    ## Function will return a 1 if checksum is invalid
+
+    local NEXTVAL LEN NMEA_CHECKSUM GEN_CHECKSUM
+
+    ## Process the input string
+    STRING="${1}"
+    NMEA_CHECKSUM="${STRING#*\*}"                  ## Chksum is after the *
+    [[ ${#NMEA_CHECKSUM} = 2 ]] || return 1        ## must be 2 characters
+
+    ## Loop through STRING, convert each char to ascii val and xor.
+    ## Checksumming should start at second character (x=1) to skip $
+    XOR=0
+    for (( x=1; x<"${#STRING}"; x++ )); do       ## C style for loop
+        [[ ${STRING:$x:1} = '*' ]] && break      ## Stop at * (just in case)
+        printf -v NEXTVAL '%d' "'${STRING:$x:1}" ## convert character to ascii
+        (( XOR^="${NEXTVAL}" ))                  ## xor values
+    done
+
+    ## Convert final value into hex
+    ## Compare to existing checksum
+    printf -v GEN_CHECKSUM '%02X' "${XOR}"
+    [[ ${NMEA_CHECKSUM} = ${GEN_CHECKSUM} ]] || return 1
+    }
+
+fn_generate_xor_checksum() {  ## Converts a string to NMEA 0183 style sentence.
+    ## Expects arg without any $ or *
+    ## Stores result in STRING
+    local NEXTVAL NMEA_CHECKSUM GEN_CHECKSUM
+    STRING="${1}"
+
+    ## Loop through STRING, summing ascii values
+    XOR=0
+    for (( x=0; x<"${#STRING}"; x++ )); do       ## C style for loop
+        printf -v NEXTVAL '%d' "'${STRING:$x:1}" ## convert character to ascii
+        (( XOR^="${NEXTVAL}" ))                  ## xor values
+    done
+
+    ## Convert final value into hex
+    ## Add $, *, and the checksum in the proper place
+    printf -v STRING '$%s*%02X' "${STRING}" "${XOR}"
+    }
+
+fn_output_to_logfile() {
+    ## Is it 1970?
+    [[ ${YR} -ge 2017 ]] || return 1
+
+    local DATA PIPE
+    PIPE="${PIPEDIR}"/"${CRUISEID}"_"${STAMP}"_"${DAY}"_logfile
+
+    ## Format the data output
+    DATA="${TIMESTAMP} ${STAMP,,} ${LINE}"
+
+    ## Specify the logfile and create necessary directories
+    LOGDIR="${DATADIR}"/"${CRUISEID}"/"${STAMP,,}"
+    LOGFILE="${LOGDIR}"/"${STAMP,,}"_"${DAY}"_raw
+    [[ -d ${LOGDIR} ]] || mkdir -p "${LOGDIR}"
+
+    ## Make sure pipe exists
+    [[ -w ${PIPE} ]] || socat -T60 -u pty,echo=0,link="${PIPE}" GOPEN:"${LOGFILE}" &
+
+    ## Wait for pipe to be writeable
+    ## the X counter avoids a possible race condition
+    X=0
+    until [[ -w ${PIPE} ]]; do
+        let X+=1
+        [[ ${X} -le 1000 ]] || return 1
+    done
+
+    ## Print data into pipe
+    printf '%s\n' "${DATA}" >> "${PIPE}"
+    }
+
+# ==============================================================================================
+# Bashdaq command and control functions
+# ==============================================================================================
+
+fn_bd_cruiseid() { ## CruiseID update
+    fn_verify_xor_checksum "${LINE}" || return 1
+    CRUISEID="${ARRAY[1]}"
+    echo ${CRUISEID} > ${CRUISEFILE}
+    }
+
+#=====================================================================================================
+# Execute
+#=====================================================================================================
+
+fn_main "$@"
